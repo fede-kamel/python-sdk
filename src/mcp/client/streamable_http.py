@@ -50,6 +50,32 @@ DEFAULT_RECONNECTION_DELAY_MS = 1000  # 1 second fallback when server doesn't pr
 MAX_RECONNECTION_ATTEMPTS = 2  # Max retry attempts before giving up
 
 
+def _get_default_origin(url: str) -> str | None:
+    """Derive a default ``Origin`` for *url*.
+
+    Spec-compliant servers guard state-changing requests against DNS-rebinding
+    and CSRF by requiring same-origin proof (e.g. the Go SDK wraps handlers in
+    ``net/http``'s ``CrossOriginProtection``, which denies any request whose
+    ``Origin`` host does not match the request ``Host``). A bare server-to-server
+    client that sends no ``Origin`` is indistinguishable from such an attack and
+    is rejected with ``403``.
+
+    The origin is built from ``httpx.URL`` so it uses the exact same scheme,
+    host, and port normalization httpx applies when emitting the ``Host`` header
+    (default ports dropped, IPv6 hosts bracketed, any userinfo stripped). That
+    guarantees the ``Origin`` we send and the ``Host`` the server compares it to
+    agree even for inputs like ``https://host:443/mcp`` where naive string
+    parsing would keep the redundant ``:443`` and still fail the check.
+
+    Returns ``None`` for non-HTTP(S) URLs or URLs without an authority, where no
+    meaningful web origin exists.
+    """
+    parsed = httpx.URL(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc.decode('ascii')}"
+
+
 class StreamableHTTPError(Exception):
     """Base exception for StreamableHTTP transport errors."""
 
@@ -72,13 +98,17 @@ class RequestContext:
 class StreamableHTTPTransport:
     """StreamableHTTP client transport implementation."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, default_origin: str | None = None) -> None:
         """Initialize the StreamableHTTP transport.
 
         Args:
             url: The endpoint URL.
+            default_origin: ``Origin`` header to send when the caller has not
+                configured one on the HTTP client. Lets spec-compliant servers
+                accept the handshake as same-origin; see ``_get_default_origin``.
         """
         self.url = url
+        self.default_origin = default_origin
         self.session_id: str | None = None
         self.protocol_version: str | None = None
 
@@ -92,6 +122,10 @@ class StreamableHTTPTransport:
             "accept": "application/json, text/event-stream",
             "content-type": "application/json",
         }
+        # Prove same-origin to CSRF/DNS-rebinding guards when the caller hasn't
+        # set an Origin of their own (see _get_default_origin).
+        if self.default_origin:
+            headers["origin"] = self.default_origin
         # Add session headers if available
         if self.session_id:
             headers[MCP_SESSION_ID] = self.session_id
@@ -547,7 +581,11 @@ async def streamable_http_client(
         # Create default client with recommended MCP timeouts
         client = create_mcp_http_client()
 
-    transport = StreamableHTTPTransport(url)
+    # Only supply a default Origin if the caller hasn't set one on the client,
+    # so an explicit Origin (e.g. a multi-tenant proxy's) always wins. The
+    # client's own headers are left untouched.
+    default_origin = None if "origin" in client.headers else _get_default_origin(url)
+    transport = StreamableHTTPTransport(url, default_origin=default_origin)
 
     logger.debug(f"Connecting to StreamableHTTP endpoint: {url}")
 

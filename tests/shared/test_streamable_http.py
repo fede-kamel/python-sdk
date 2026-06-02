@@ -29,7 +29,7 @@ from starlette.routing import Mount
 
 from mcp import MCPError, types
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import StreamableHTTPTransport, streamable_http_client
+from mcp.client.streamable_http import StreamableHTTPTransport, _get_default_origin, streamable_http_client
 from mcp.server import Server, ServerRequestContext
 from mcp.server.streamable_http import (
     MCP_PROTOCOL_VERSION_HEADER,
@@ -765,6 +765,89 @@ def test_streamable_http_transport_init_validation():
 
     with pytest.raises(ValueError):
         StreamableHTTPServerTransport(mcp_session_id="test\n")
+
+
+def test_get_default_origin_normalizes_authority():
+    """The default Origin matches the Host header httpx emits for the same URL."""
+    # Default ports are dropped — otherwise Origin "https://h:443" would not
+    # match the Host "h" httpx sends, and a same-origin check would still fail.
+    assert _get_default_origin("https://example.com:443/mcp?token=abc") == "https://example.com"
+    assert _get_default_origin("http://example.com:80/mcp") == "http://example.com"
+    # Non-default ports are kept; IPv6 hosts stay bracketed; userinfo is stripped.
+    assert _get_default_origin("https://example.com:8443/mcp") == "https://example.com:8443"
+    assert _get_default_origin("http://user:pass@[::1]:8080/mcp") == "http://[::1]:8080"
+
+
+def test_get_default_origin_returns_none_without_web_origin():
+    """URLs with no meaningful web origin yield no Origin header."""
+    assert _get_default_origin("ws://example.com/mcp") is None  # non-HTTP scheme
+    assert _get_default_origin("http:///mcp") is None  # no authority
+
+
+@pytest.mark.anyio
+async def test_streamable_http_client_sends_same_origin_handshake():
+    """Default Origin satisfies a CrossOriginProtection-style server (issue #2727).
+
+    Reference servers (e.g. the Go SDK's net/http CrossOriginProtection) deny any
+    state-changing request whose Origin host does not match the Host. The client
+    must therefore send an Origin derived from the target URL, normalized to match
+    the Host it actually emits — including the explicit ``:443`` case below.
+    """
+    seen = anyio.Event()
+    recorded: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        origin = request.headers.get("origin")
+        host = request.headers.get("host")
+        # Mirror net/http CrossOriginProtection: same-origin POSTs only.
+        same_origin = origin is not None and origin.split("://", 1)[-1] == host
+        recorded.update(origin=origin, host=host, status=202 if same_origin else 403)
+        if not seen.is_set():
+            seen.set()
+        return httpx.Response(recorded["status"], request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        # Explicit :443 is the case naive Origin derivation gets wrong.
+        async with streamable_http_client("https://mcp.example.com:443/mcp", http_client=client) as (
+            _read_stream,
+            write_stream,
+        ):
+            await write_stream.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=1, method="ping")))
+            with anyio.fail_after(5):
+                await seen.wait()
+
+    assert recorded["origin"] == "https://mcp.example.com"
+    assert recorded["host"] == "mcp.example.com"
+    assert recorded["status"] == 202  # handshake accepted as same-origin, not 403
+    assert "origin" not in client.headers  # caller's client is left untouched
+
+
+@pytest.mark.anyio
+async def test_streamable_http_client_preserves_custom_origin():
+    """A caller-configured Origin always wins over the derived default."""
+    seen = anyio.Event()
+    recorded: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded["origin"] = request.headers.get("origin")
+        if not seen.is_set():
+            seen.set()
+        return httpx.Response(202, request=request)
+
+    async with httpx.AsyncClient(
+        headers={"Origin": "https://proxy.example"},
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        async with streamable_http_client("https://mcp.example.com/mcp", http_client=client) as (
+            _read_stream,
+            write_stream,
+        ):
+            await write_stream.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=1, method="ping")))
+            with anyio.fail_after(5):
+                await seen.wait()
+
+    assert recorded["origin"] == "https://proxy.example"
+    assert client.headers["origin"] == "https://proxy.example"
 
 
 def test_session_termination(basic_server: None, basic_server_url: str):
